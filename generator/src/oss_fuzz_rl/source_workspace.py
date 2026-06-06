@@ -12,6 +12,7 @@ from pathlib import Path
 from oss_fuzz_rl.sanitizer import FUZZ_ARTIFACT_RE, scrub_fuzz_artifacts
 
 WORKDIR_RE = re.compile(r"^\s*WORKDIR\s+(.+?)\s*$", re.MULTILINE)
+SAFE_CONTEXT_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,15 @@ class SourceCommand:
     def is_fuzzer_artifact(self) -> bool:
         haystack = f"{self.url} {self.dest}"
         return bool(FUZZ_ARTIFACT_RE.search(haystack))
+
+
+@dataclass(frozen=True)
+class DockerfileInstruction:
+    """A logical Dockerfile instruction and its physical line span."""
+
+    start: int
+    end: int
+    text: str
 
 
 def parse_source_commands(dockerfile: Path) -> list[SourceCommand]:
@@ -105,23 +115,161 @@ def materialize_source(
     return destination
 
 
+def rewrite_source_checkout_to_local_copy(
+    dockerfile: Path,
+    command: SourceCommand,
+    *,
+    local_context_dir: str = ".oss-fuzz-rl-source",
+) -> bool:
+    """Replace a primary source checkout RUN segment with a local Docker COPY.
+
+    The local source tree must already be present in the Docker build context at
+    ``local_context_dir/<dest_name>``. The replacement is intentionally applied
+    to a temporary eval copy of the OSS-Fuzz project, not to the user's workspace.
+    """
+
+    if not dockerfile.is_file():
+        return False
+
+    changed = False
+    while True:
+        lines = dockerfile.read_text(encoding="utf-8", errors="ignore").splitlines(
+            keepends=True
+        )
+        content = "".join(lines)
+        for instruction in _dockerfile_instruction_spans(content):
+            logical = instruction.text
+            if not logical.lstrip().startswith("RUN "):
+                continue
+            run_body = logical.lstrip()[4:]
+            replacement = _local_source_replacement_lines(run_body, command, local_context_dir)
+            if replacement is None:
+                continue
+            lines[instruction.start : instruction.end] = replacement
+            dockerfile.write_text("".join(lines), encoding="utf-8")
+            changed = True
+            break
+        else:
+            return changed
+
+
+def local_source_context_name(command: SourceCommand) -> str:
+    """Return a Docker build-context-safe source directory name."""
+
+    if SAFE_CONTEXT_NAME_RE.fullmatch(command.dest_name):
+        return command.dest_name
+    return "source"
+
+
 def _dockerfile_logical_lines(content: str) -> list[str]:
-    lines: list[str] = []
+    return [instruction.text for instruction in _dockerfile_instruction_spans(content)]
+
+
+def _dockerfile_instruction_spans(content: str) -> list[DockerfileInstruction]:
+    instructions: list[DockerfileInstruction] = []
+    raw_lines = content.splitlines(keepends=True)
     current = ""
-    for raw_line in content.splitlines():
-        line = raw_line.rstrip()
+    start = 0
+    for index, raw_line in enumerate(raw_lines):
+        line = raw_line.rstrip("\r\n").rstrip()
         if not current:
+            start = index
             current = line
         else:
             current += " " + line.lstrip()
         if current.endswith("\\"):
             current = current[:-1].rstrip()
             continue
-        lines.append(current)
+        instructions.append(DockerfileInstruction(start=start, end=index + 1, text=current))
         current = ""
     if current:
-        lines.append(current)
-    return lines
+        instructions.append(DockerfileInstruction(start=start, end=len(raw_lines), text=current))
+    return instructions
+
+
+def _local_source_replacement_lines(
+    run_body: str,
+    command: SourceCommand,
+    local_context_dir: str,
+) -> list[str] | None:
+    segments, separators = _split_shell_segments_with_separators(run_body)
+    selected_index = None
+    destination_command = None
+    for index, segment in enumerate(segments):
+        parsed = (
+            _parse_git_clones(segment)
+            if command.kind == "git"
+            else _parse_svn_checkouts(segment)
+        )
+        matching = [found for found in parsed if _same_source_checkout(found, command)]
+        if matching:
+            selected_index = index
+            destination_command = matching[0]
+            break
+    if selected_index is None or destination_command is None:
+        return None
+
+    replacement: list[str] = []
+    before = _join_shell_segments(
+        segments[:selected_index],
+        separators[: max(0, selected_index - 1)],
+    )
+    after = _join_shell_segments(segments[selected_index + 1 :], separators[selected_index + 1 :])
+    if before:
+        replacement.append(f"RUN {before}\n")
+    replacement.append(
+        _local_copy_instruction(command, local_context_dir, destination_command)
+    )
+    if after:
+        replacement.append(f"RUN {after}\n")
+    return replacement
+
+
+def _split_shell_segments_with_separators(run_body: str) -> tuple[list[str], list[str]]:
+    parts = re.split(r"\s*(&&|;)\s*", run_body)
+    segments = [part.strip() for part in parts[0::2] if part.strip()]
+    separators = [part.strip() for part in parts[1::2]]
+    return segments, separators
+
+
+def _join_shell_segments(segments: list[str], separators: list[str]) -> str:
+    if not segments:
+        return ""
+    output = [segments[0]]
+    for index, segment in enumerate(segments[1:]):
+        separator = separators[index] if index < len(separators) else "&&"
+        output.append(f" {separator} {segment}")
+    return "".join(output)
+
+
+def _same_source_command(left: SourceCommand, right: SourceCommand) -> bool:
+    return (
+        left.kind == right.kind
+        and left.url == right.url
+        and left.dest_name == right.dest_name
+    )
+
+
+def _same_source_checkout(left: SourceCommand, right: SourceCommand) -> bool:
+    return left.kind == right.kind and left.url == right.url
+
+
+def _local_copy_instruction(
+    command: SourceCommand,
+    local_context_dir: str,
+    destination_command: SourceCommand | None = None,
+) -> str:
+    destination_command = destination_command or command
+    context_source = f"{local_context_dir.rstrip('/')}/{local_source_context_name(command)}/"
+    image_destination = _local_copy_destination(destination_command.dest)
+    return f"COPY {context_source} {image_destination}\n"
+
+
+def _local_copy_destination(dest: str) -> str:
+    dest = dest.rstrip("/")
+    if dest.startswith("/") or dest.startswith("$GOPATH") or dest.startswith("${GOPATH}"):
+        return f"{dest}/"
+    return f"$SRC/{dest}/"
 
 
 def _parse_git_clones(run_body: str) -> list[SourceCommand]:
@@ -175,7 +323,25 @@ def _source_from_git_tokens(tokens: list[str]) -> SourceCommand | None:
     index = 0
     url: str | None = None
     dest: str | None = None
-    options_with_values = {"--branch", "-b", "--depth", "--reference", "--origin", "-o"}
+    options_with_values = {
+        "--branch",
+        "-b",
+        "--config",
+        "-c",
+        "--depth",
+        "--filter",
+        "--jobs",
+        "-j",
+        "--origin",
+        "-o",
+        "--reference",
+        "--reference-if-able",
+        "--separate-git-dir",
+        "--server-option",
+        "--template",
+        "--upload-pack",
+        "-u",
+    }
     passthrough_flags = {"--recurse-submodules", "--shallow-submodules", "--single-branch"}
 
     while index < len(tokens):

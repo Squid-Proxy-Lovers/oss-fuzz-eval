@@ -4,7 +4,10 @@ version = "0.1.0"
 description = "RL task generator and reward scorer for OSS-Fuzz harness-writing agents"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "tree-sitter>=0.25",
+    "tree-sitter-language-pack>=1.8",
+]
 
 [project.scripts]
 oss-fuzz-rl = "oss_fuzz_rl.cli:main"

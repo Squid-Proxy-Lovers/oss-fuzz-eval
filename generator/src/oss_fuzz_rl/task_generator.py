@@ -155,6 +155,12 @@ Requirements:
 
 - Keep edits scoped to the provided workspace.
 - Add or update only the harness source and minimal build registration needed.
+- `oss-fuzz-project/` is editable and is the expected place for OSS-Fuzz
+  harness files and build registration changes.
+- Do not rewrite Dockerfile source checkout plumbing just to use the local
+  source tree; the grader builds against the provided local source tree by
+  rewriting checkout steps in a temporary copy.
+- Do not read, depend on, or modify hidden oracle files.
 - The resulting fuzz target must build as an OSS-Fuzz target.
 - The target must run under the project language's OSS-Fuzz engine/sanitizer
   constraints.

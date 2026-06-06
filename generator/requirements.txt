@@ -1,0 +1,4 @@
+tree-sitter>=0.25
+tree-sitter-language-pack>=1.8
+pytest>=8
+ruff>=0.11

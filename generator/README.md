@@ -15,6 +15,7 @@ with a single `task-end` tool call.
 
 ```bash
 cd generator
+python -m pip install -r requirements.txt
 uv run oss-fuzz-rl index --oss-fuzz-dir ../oss-fuzz
 uv run oss-fuzz-rl generate --oss-fuzz-dir ../oss-fuzz --out /tmp/ofuzz-tasks --limit 5
 uv run oss-fuzz-rl score --task /tmp/ofuzz-tasks/<task-id>
@@ -25,6 +26,16 @@ Static scoring works without Docker. Full scoring can run OSS-Fuzz build,
 
 ```bash
 uv run oss-fuzz-rl score --task /tmp/ofuzz-tasks/<task-id> --oss-fuzz-dir ../oss-fuzz --run-oss-fuzz
+```
+
+Tree-sitter dependencies are mandatory for task generation and scoring. The
+profiler does not provide a regex fallback; missing parser dependencies or
+unsupported grammars fail the run.
+
+Reward weights can be changed with a schema-versioned config:
+
+```bash
+uv run oss-fuzz-rl score --task /tmp/ofuzz-tasks/<task-id> --reward-config reward-config.json
 ```
 
 ## Task Layout
@@ -41,10 +52,25 @@ Do not expose `oracle/` to the policy during training.
 
 ## Reward Shape
 
-The scorer returns a scalar in `[0, 2]` plus detailed components:
+The scorer returns a `reward.v3` report with a normalized scalar in `[0, 1]`.
+The report includes `groups`, `microcomponents`, `raw_metrics`, `caps`,
+`artifacts`, and the `reward_config` used to compute the scalar.
 
-- Build/conformance, runtime, AST/reference structure, and subsystem focus
-  contribute up to `1.0`.
-- Fuzz Introspector/coverage performance contributes up to `1.0`.
-- Build and runtime failures cap the scalar to avoid rewarding non-working
-  harnesses.
+- Hard-zero gates still apply for missing required `task-end` calls and hidden
+  oracle access.
+- Failed builds cap reward at `0.05`; failed runtime/checks cap reward at
+  `0.25`; candidate-induced coverage failures after build/check cap reward at
+  `0.35`.
+- Scalar scoring requires dynamic OSS-Fuzz build/check/coverage data and hidden
+  oracle coverage. Static tree-sitter profiling feeds diagnostics,
+  microcomponents, gates, and caps, but there is no static scalar fallback.
+- Creating more than one fuzz harness is allowed. Additional harnesses are
+  judged through normal build, runtime, focus, and coverage signals; there is
+  no separate harness-count quality reward.
+- Built-in dynamic coverage scoring is relative to hidden oracle coverage
+  breadth: for lines, functions, and regions, matching the oracle's covered
+  count scores `0.8`; above-oracle coverage approaches `1.0` as the candidate
+  approaches the oracle coverage denominator.
+- `reward_config.v3` uses one dynamic scheme with a continuous smoothstep
+  schedule from initial to mature weights. The old static and discrete
+  early/middle/late configurations are not supported.

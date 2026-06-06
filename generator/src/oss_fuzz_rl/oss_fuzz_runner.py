@@ -10,6 +10,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from oss_fuzz_rl.models import CoverageMetrics
+from oss_fuzz_rl.source_workspace import (
+    local_source_context_name,
+    rewrite_source_checkout_to_local_copy,
+    select_primary_source_command,
+)
+
+LOCAL_SOURCE_CONTEXT_DIR = ".oss-fuzz-rl-source"
 
 
 @dataclass(frozen=True)
@@ -47,16 +54,30 @@ def run_oss_fuzz_checks(
     oss_fuzz_dir: Path,
     project_name: str,
     candidate_project_dir: Path,
+    source_workspace_dir: Path | None = None,
     keep_eval_dir: bool = False,
     coverage_seconds: int = 30,
 ) -> OSSFuzzRunResult:
     """Run OSS-Fuzz build/check/coverage in a temporary materialized checkout."""
 
+    if (candidate_project_dir / "oss-fuzz-project").is_dir():
+        source_workspace_dir = source_workspace_dir or candidate_project_dir
+        candidate_project_dir = candidate_project_dir / "oss-fuzz-project"
+
     temp = tempfile.TemporaryDirectory(prefix="oss-fuzz-rl-")
     eval_root = Path(temp.name) / "oss-fuzz"
-    _materialize_minimal_checkout(oss_fuzz_dir, eval_root, project_name, candidate_project_dir)
+    _materialize_minimal_checkout(
+        oss_fuzz_dir,
+        eval_root,
+        project_name,
+        candidate_project_dir,
+        source_workspace_dir=source_workspace_dir,
+    )
 
-    build_image = _run(("python3", "infra/helper.py", "build_image", project_name), eval_root)
+    build_image = _run(
+        ("python3", "infra/helper.py", "build_image", "--no-pull", project_name),
+        eval_root,
+    )
     build_fuzzers = None
     check_build = None
     coverage = None
@@ -130,12 +151,42 @@ def _materialize_minimal_checkout(
     eval_root: Path,
     project_name: str,
     candidate_project_dir: Path,
+    *,
+    source_workspace_dir: Path | None = None,
 ) -> None:
     eval_root.mkdir(parents=True)
     for name in ("infra",):
         shutil.copytree(oss_fuzz_dir / name, eval_root / name, symlinks=True)
     (eval_root / "projects").mkdir()
-    shutil.copytree(candidate_project_dir, eval_root / "projects" / project_name, symlinks=True)
+    eval_project_dir = eval_root / "projects" / project_name
+    shutil.copytree(candidate_project_dir, eval_project_dir, symlinks=True)
+    if source_workspace_dir is not None:
+        inject_local_source_checkout(eval_project_dir, source_workspace_dir)
+
+
+def inject_local_source_checkout(project_dir: Path, source_workspace_dir: Path) -> bool:
+    """Copy local task source into the Docker context and rewrite its checkout."""
+
+    dockerfile = project_dir / "Dockerfile"
+    source_command = select_primary_source_command(dockerfile)
+    if source_command is None:
+        return False
+
+    local_source = source_workspace_dir / source_command.dest_name
+    if not local_source.is_dir():
+        return False
+
+    context_root = project_dir / LOCAL_SOURCE_CONTEXT_DIR
+    context_source = context_root / local_source_context_name(source_command)
+    if context_source.exists():
+        shutil.rmtree(context_source)
+    context_source.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(local_source, context_source, symlinks=True)
+    return rewrite_source_checkout_to_local_copy(
+        dockerfile,
+        source_command,
+        local_context_dir=LOCAL_SOURCE_CONTEXT_DIR,
+    )
 
 
 def _run(command: tuple[str, ...], cwd: Path, timeout: int = 30 * 60) -> CommandResult:

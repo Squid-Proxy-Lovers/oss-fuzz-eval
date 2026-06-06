@@ -10,7 +10,7 @@ from oss_fuzz_rl.episode import EpisodeTrace
 from oss_fuzz_rl.jsonio import write_json
 from oss_fuzz_rl.project_index import index_projects
 from oss_fuzz_rl.replay import restore_oracle_workspace
-from oss_fuzz_rl.reward import score_task
+from oss_fuzz_rl.reward import baseline_oracle_coverage, score_task
 from oss_fuzz_rl.task_generator import generate_tasks
 
 
@@ -37,12 +37,20 @@ def main(argv: list[str] | None = None) -> int:
     score_parser.add_argument("--oss-fuzz-dir", type=Path)
     score_parser.add_argument("--run-oss-fuzz", action="store_true")
     score_parser.add_argument("--require-task-end", action="store_true")
+    score_parser.add_argument("--reward-config", type=Path)
     score_parser.add_argument("--json-out", type=Path)
+
+    baseline_parser = sub.add_parser("baseline-oracle", help="Generate hidden oracle coverage")
+    baseline_parser.add_argument("--task", type=Path, required=True)
+    baseline_parser.add_argument("--oss-fuzz-dir", type=Path, required=True)
+    baseline_parser.add_argument("--coverage-seconds", type=int, default=30)
+    baseline_parser.add_argument("--json-out", type=Path)
 
     replay_parser = sub.add_parser("replay-oracle", help="Restore hidden oracle and score it")
     replay_parser.add_argument("--task", type=Path, required=True)
     replay_parser.add_argument("--oss-fuzz-dir", type=Path)
     replay_parser.add_argument("--run-oss-fuzz", action="store_true")
+    replay_parser.add_argument("--reward-config", type=Path)
     replay_parser.add_argument("--json-out", type=Path)
 
     args = parser.parse_args(argv)
@@ -72,8 +80,17 @@ def main(argv: list[str] | None = None) -> int:
             oss_fuzz_dir=args.oss_fuzz_dir.resolve() if args.oss_fuzz_dir else None,
             run_oss_fuzz=args.run_oss_fuzz,
             require_task_end=args.require_task_end,
+            reward_config_path=args.reward_config.resolve() if args.reward_config else None,
         )
         _emit(report.to_json(), args.json_out)
+        return 0
+    if args.command == "baseline-oracle":
+        coverage = baseline_oracle_coverage(
+            args.task.resolve(),
+            oss_fuzz_dir=args.oss_fuzz_dir.resolve(),
+            coverage_seconds=args.coverage_seconds,
+        )
+        _emit({"coverage": coverage.to_json()}, args.json_out)
         return 0
     if args.command == "replay-oracle":
         workspace = restore_oracle_workspace(args.task.resolve())
@@ -83,6 +100,7 @@ def main(argv: list[str] | None = None) -> int:
             oss_fuzz_dir=args.oss_fuzz_dir.resolve() if args.oss_fuzz_dir else None,
             run_oss_fuzz=args.run_oss_fuzz,
             require_task_end=False,
+            reward_config_path=args.reward_config.resolve() if args.reward_config else None,
         )
         _emit(report.to_json(), args.json_out)
         return 0

@@ -92,6 +92,10 @@ DOC_REDACTION_NAMES = {
 }
 CMAKE_REDACTION_EXTENSIONS = {".cmake"}
 CMAKE_REDACTION_NAMES = {"CMakeLists.txt"}
+MESON_REDACTION_NAMES = {"meson.build", "meson_options.txt"}
+CMAKE_COMMAND_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+GO_FUZZ_FUNCTION_RE = re.compile(r"(?m)^func\s+Fuzz[A-Za-z0-9_]*\s*\(")
+GO_IMPORT_RE = re.compile(r'\s*(?:(?P<alias>[A-Za-z_][A-Za-z0-9_]*|[_.])\s+)?\"(?P<path>[^\"]+)\"')
 
 FUZZ_HARNESS_CONTENT_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
     ("LLVMFuzzerTestOneInput", re.compile(rb"\bLLVMFuzzerTestOneInput\s*\(")),
@@ -248,13 +252,34 @@ def _redact_remaining_guidance(
     for path in sorted(root.rglob("*")):
         if not path.is_file() or _has_deleted_ancestor(path, deleted):
             continue
+        if path.suffix.lower() == ".go":
+            rewrite = _remove_go_fuzz_functions(path)
+            if rewrite is not None:
+                pattern, lines = rewrite
+                records.append(
+                    SanitizerRecord(
+                        path=path.relative_to(root).as_posix(),
+                        action="redact",
+                        category="content",
+                        reason="harness-entrypoint-content",
+                        pattern=pattern,
+                        lines=tuple(lines),
+                    )
+                )
+            continue
         if not _is_line_redaction_candidate(path):
             continue
         match = _guidance_text_match(path)
         if match is None:
             continue
         content, matches = match
-        redacted = _redact_lines(content, matches, path)
+        if _is_cmake_file(path):
+            redacted, lines = _remove_cmake_guidance(content, matches)
+        elif _is_meson_file(path):
+            redacted, lines = _remove_meson_guidance(content, matches)
+        else:
+            redacted = _redact_lines(content, matches, path)
+            lines = set(matches)
         if redacted == content:
             continue
         path.write_text(redacted, encoding="utf-8")
@@ -265,7 +290,7 @@ def _redact_remaining_guidance(
                 category="content",
                 reason="fuzz-guidance-content",
                 pattern=",".join(sorted(set(matches.values()))),
-                lines=tuple(sorted(matches.keys())),
+                lines=tuple(sorted(lines)),
             )
         )
 
@@ -290,6 +315,8 @@ def _deletion_match(path: Path) -> tuple[str, str, str | None] | None:
 def _harness_content_pattern(path: Path) -> str | None:
     if path.suffix.lower() not in SOURCE_SCAN_EXTENSIONS:
         return None
+    if path.suffix.lower() == ".go":
+        return _go_fuzz_file_delete_pattern(path)
     content = _read_small_bytes(path)
     if content is None:
         return None
@@ -297,6 +324,16 @@ def _harness_content_pattern(path: Path) -> str | None:
         if pattern.search(content):
             return name
     return None
+
+
+def _go_fuzz_file_delete_pattern(path: Path) -> str | None:
+    content = _read_small_text(path)
+    if content is None:
+        return None
+    spans = _go_fuzz_function_spans(content)
+    if not spans or not _go_file_is_fuzz_only(content, spans):
+        return None
+    return "go-fuzz-test"
 
 
 def _guidance_text_match(path: Path) -> tuple[str, dict[int, str]] | None:
@@ -313,45 +350,414 @@ def _guidance_text_match(path: Path) -> tuple[str, dict[int, str]] | None:
                 break
     if not matches:
         return None
-    return content, _expand_redaction_lines(content, matches, path)
+    return content, matches
 
 
-def _expand_redaction_lines(
-    content: str,
-    matches: dict[int, str],
-    path: Path,
-) -> dict[int, str]:
-    expanded = dict(matches)
+def _remove_cmake_guidance(content: str, matches: dict[int, str]) -> tuple[str, set[int]]:
     lines = content.splitlines()
-    if _is_cmake_file(path):
-        _expand_cmake_blocks(lines, expanded)
-    for line_no, name in tuple(matches.items()):
-        index = line_no - 1
-        if _line_opens_block(lines[index]):
-            depth = _paren_delta(lines[index])
-            for next_index in range(index + 1, len(lines)):
-                expanded.setdefault(next_index + 1, name)
-                depth += _paren_delta(lines[next_index])
-                if depth <= 0:
-                    break
-    return expanded
+    delete_indexes: set[int] = set()
+    fuzz_targets: set[str] = set()
+
+    for line_no in sorted(matches):
+        command = _cmake_command_at(lines, line_no - 1)
+        if command is None:
+            delete_indexes.add(line_no - 1)
+            continue
+        start, end, name, text = command
+        if name == "if":
+            if _cmake_condition_is_fuzz_only(text):
+                delete_indexes.update(_cmake_fuzz_if_delete_indexes(lines, start))
+            continue
+        if name in {"elseif", "else", "endif"}:
+            continue
+        delete_indexes.update(range(start, end + 1))
+        if name in {"add_executable", "add_library"}:
+            target = _cmake_first_arg(text)
+            if target:
+                fuzz_targets.add(target)
+
+    if fuzz_targets:
+        for index, _line in enumerate(lines):
+            command = _cmake_command_at(lines, index)
+            if command is None:
+                continue
+            start, end, name, text = command
+            if start != index:
+                continue
+            if _cmake_command_references_fuzz_target(name, text, fuzz_targets):
+                delete_indexes.update(range(start, end + 1))
+
+    return _remove_line_indexes(content, delete_indexes), {index + 1 for index in delete_indexes}
 
 
-def _expand_cmake_blocks(lines: list[str], expanded: dict[int, str]) -> None:
-    for line_no, name in tuple(expanded.items()):
-        index = line_no - 1
-        stripped = lines[index].strip().lower()
-        if stripped.startswith("if("):
-            depth = 0
-            for next_index in range(index, len(lines)):
-                next_stripped = lines[next_index].strip().lower()
-                if next_stripped.startswith("if("):
-                    depth += 1
-                expanded.setdefault(next_index + 1, name)
-                if next_stripped.startswith("endif"):
-                    depth -= 1
-                    if depth <= 0:
-                        break
+def _remove_meson_guidance(content: str, matches: dict[int, str]) -> tuple[str, set[int]]:
+    lines = content.splitlines()
+    delete_indexes: set[int] = set()
+    for line_no in sorted(matches):
+        start, end = _build_command_span(lines, line_no - 1)
+        delete_indexes.update(range(start, end + 1))
+    return _remove_line_indexes(content, delete_indexes), {index + 1 for index in delete_indexes}
+
+
+def _remove_go_fuzz_functions(path: Path) -> tuple[str, list[int]] | None:
+    content = _read_small_text(path)
+    if content is None:
+        return None
+    spans = _go_fuzz_function_spans(content)
+    if not spans:
+        return None
+    rewritten, lines = _remove_go_spans(content, spans)
+    if rewritten == content:
+        return None
+    path.write_text(rewritten, encoding="utf-8")
+    return "go-fuzz-test", lines
+
+
+def _remove_go_spans(content: str, spans: list[tuple[int, int]]) -> tuple[str, list[int]]:
+    removed = "\n".join(content[start:end] for start, end in spans)
+    rewritten = content
+    for start, end in sorted(spans, reverse=True):
+        rewritten = rewritten[:start] + rewritten[end:]
+    rewritten = _remove_unused_go_imports(rewritten, removed)
+    return rewritten, _line_numbers_for_spans(content, spans)
+
+
+def _go_fuzz_function_spans(content: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    for match in GO_FUZZ_FUNCTION_RE.finditer(content):
+        open_brace = content.find("{", match.end())
+        if open_brace == -1:
+            continue
+        signature = content[match.start() : open_brace]
+        if not re.search(r"\*\s*testing\.F\b", signature):
+            continue
+        close_brace = _find_matching_go_brace(content, open_brace)
+        if close_brace is None:
+            continue
+        end = close_brace + 1
+        if end < len(content) and content[end] == "\n":
+            end += 1
+        spans.append((match.start(), end))
+    return spans
+
+
+def _find_matching_go_brace(content: str, open_brace: int) -> int | None:
+    depth = 0
+    index = open_brace
+    state = "normal"
+    escaped = False
+    while index < len(content):
+        char = content[index]
+        next_char = content[index + 1] if index + 1 < len(content) else ""
+        if state == "line-comment":
+            if char == "\n":
+                state = "normal"
+        elif state == "block-comment":
+            if char == "*" and next_char == "/":
+                state = "normal"
+                index += 1
+        elif state == "string":
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                state = "normal"
+        elif state == "raw-string":
+            if char == "`":
+                state = "normal"
+        elif state == "rune":
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == "'":
+                state = "normal"
+        elif char == "/" and next_char == "/":
+            state = "line-comment"
+            index += 1
+        elif char == "/" and next_char == "*":
+            state = "block-comment"
+            index += 1
+        elif char == '"':
+            state = "string"
+        elif char == "`":
+            state = "raw-string"
+        elif char == "'":
+            state = "rune"
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    return None
+
+
+def _go_file_is_fuzz_only(content: str, spans: list[tuple[int, int]]) -> bool:
+    remaining = content
+    for start, end in sorted(spans, reverse=True):
+        remaining = remaining[:start] + remaining[end:]
+    remaining = _remove_go_import_declarations(remaining)
+    for line in remaining.splitlines():
+        stripped = line.strip()
+        if (
+            not stripped
+            or stripped.startswith("//")
+            or stripped.startswith("/*")
+            or stripped == "*/"
+        ):
+            continue
+        if stripped.startswith("package "):
+            continue
+        return False
+    return True
+
+
+def _remove_unused_go_imports(content: str, removed: str) -> str:
+    lines = content.splitlines()
+    if not lines:
+        return content
+    code_without_imports = _remove_go_import_declarations(content)
+    new_lines: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if line.strip() == "import (":
+            end = _go_import_block_end(lines, index)
+            if end is None:
+                new_lines.append(line)
+                index += 1
+                continue
+            specs = lines[index + 1 : end]
+            kept = [
+                spec
+                for spec in specs
+                if not _go_import_spec_removed(spec, code_without_imports, removed)
+            ]
+            if any(GO_IMPORT_RE.match(spec) for spec in kept):
+                new_lines.append(line)
+                new_lines.extend(kept)
+                new_lines.append(lines[end])
+            index = end + 1
+            continue
+        if line.lstrip().startswith("import "):
+            spec = line.split("import ", 1)[1]
+            if _go_import_spec_removed(spec, code_without_imports, removed):
+                index += 1
+                continue
+        new_lines.append(line)
+        index += 1
+    result = "\n".join(new_lines)
+    if content.endswith("\n"):
+        result += "\n"
+    return result
+
+
+def _remove_go_import_declarations(content: str) -> str:
+    lines = content.splitlines()
+    kept: list[str] = []
+    index = 0
+    while index < len(lines):
+        stripped = lines[index].strip()
+        if stripped == "import (":
+            end = _go_import_block_end(lines, index)
+            if end is None:
+                kept.append(lines[index])
+                index += 1
+            else:
+                index = end + 1
+            continue
+        if stripped.startswith("import "):
+            index += 1
+            continue
+        kept.append(lines[index])
+        index += 1
+    return "\n".join(kept)
+
+
+def _go_import_block_end(lines: list[str], start: int) -> int | None:
+    for index in range(start + 1, len(lines)):
+        if lines[index].strip() == ")":
+            return index
+    return None
+
+
+def _go_import_spec_removed(spec: str, remaining: str, removed: str) -> bool:
+    match = GO_IMPORT_RE.match(spec)
+    if match is None:
+        return False
+    name = match.group("alias") or _go_import_default_name(match.group("path"))
+    if name in {"_", "."}:
+        return False
+    return _word_in(name, removed) and not _word_in(name, remaining)
+
+
+def _go_import_default_name(import_path: str) -> str:
+    name = import_path.rsplit("/", 1)[-1].split(".", 1)[0]
+    return name.replace("-", "_")
+
+
+def _line_numbers_for_spans(content: str, spans: list[tuple[int, int]]) -> list[int]:
+    line_numbers: set[int] = set()
+    for start, end in spans:
+        first = content.count("\n", 0, start) + 1
+        last = content.count("\n", 0, max(start, end - 1)) + 1
+        line_numbers.update(range(first, last + 1))
+    return sorted(line_numbers)
+
+
+def _word_in(word: str, content: str) -> bool:
+    return re.search(rf"\b{re.escape(word)}\b", content) is not None
+
+
+def _cmake_command_at(
+    lines: list[str],
+    index: int,
+) -> tuple[int, int, str, str] | None:
+    start, end = _build_command_span(lines, index)
+    match = CMAKE_COMMAND_RE.match(lines[start])
+    if match is None:
+        return None
+    name = match.group(1).lower()
+    return start, end, name, "\n".join(lines[start : end + 1])
+
+
+def _build_command_span(lines: list[str], index: int) -> tuple[int, int]:
+    start = index
+    for candidate in range(index, -1, -1):
+        if CMAKE_COMMAND_RE.match(lines[candidate]):
+            possible_end = _paren_command_end(lines, candidate)
+            if possible_end >= index:
+                start = candidate
+                break
+    return start, _paren_command_end(lines, start)
+
+
+def _paren_command_end(lines: list[str], start: int) -> int:
+    depth = 0
+    seen_open = False
+    for index in range(start, len(lines)):
+        line = _strip_hash_comment(lines[index])
+        if "(" in line:
+            seen_open = True
+        depth += _paren_delta(line)
+        if seen_open and depth <= 0:
+            return index
+    return start
+
+
+def _cmake_if_block_span(lines: list[str], start: int) -> tuple[int, int]:
+    depth = 0
+    for index in range(start, len(lines)):
+        command = _cmake_command_at(lines, index)
+        if command is None or command[0] != index:
+            continue
+        _start, end, name, _text = command
+        if name == "if":
+            depth += 1
+        elif name == "endif":
+            depth -= 1
+            if depth <= 0:
+                return start, end
+    return start, _paren_command_end(lines, start)
+
+
+def _cmake_fuzz_if_delete_indexes(lines: list[str], start: int) -> set[int]:
+    depth = 0
+    else_span: tuple[int, int] | None = None
+    endif_span: tuple[int, int] | None = None
+    for index in range(start, len(lines)):
+        command = _cmake_command_at(lines, index)
+        if command is None or command[0] != index:
+            continue
+        _start, end, name, _text = command
+        if name == "if":
+            depth += 1
+        elif name == "else" and depth == 1 and else_span is None:
+            else_span = (index, end)
+        elif name == "endif":
+            depth -= 1
+            if depth <= 0:
+                endif_span = (index, end)
+                break
+    if endif_span is None:
+        block_start, block_end = _cmake_if_block_span(lines, start)
+        return set(range(block_start, block_end + 1))
+    if else_span is None:
+        return set(range(start, endif_span[1] + 1))
+    delete_indexes = set(range(start, else_span[1] + 1))
+    delete_indexes.update(range(endif_span[0], endif_span[1] + 1))
+    return delete_indexes
+
+
+def _cmake_condition_is_fuzz_only(command_text: str) -> bool:
+    identifiers = [
+        token
+        for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", command_text)
+        if token.lower() not in {"if", "elseif", "and", "or", "not", "defined", "env", "on", "off"}
+    ]
+    return bool(identifiers) and all(_line_has_fuzz_guidance(token) for token in identifiers)
+
+
+def _cmake_command_references_fuzz_target(
+    name: str,
+    command_text: str,
+    fuzz_targets: set[str],
+) -> bool:
+    target_commands = {
+        "add_dependencies",
+        "set_target_properties",
+        "target_compile_definitions",
+        "target_compile_options",
+        "target_include_directories",
+        "target_link_libraries",
+        "target_link_options",
+        "target_sources",
+    }
+    if name in target_commands:
+        first_arg = _cmake_first_arg(command_text)
+        return first_arg in fuzz_targets
+    if name in {"add_test", "set_tests_properties"}:
+        return any(_word_in(target, command_text) for target in fuzz_targets)
+    return False
+
+
+def _cmake_first_arg(command_text: str) -> str | None:
+    match = re.match(r"\s*[A-Za-z_][A-Za-z0-9_]*\s*\((.*)", command_text, re.S)
+    if match is None:
+        return None
+    args = re.findall(r'"[^"]+"|\$\{[^}]+\}|[^\s()]+', match.group(1))
+    if not args:
+        return None
+    return args[0].strip('"')
+
+
+def _remove_line_indexes(content: str, indexes: set[int]) -> str:
+    lines = content.splitlines()
+    result = "\n".join(line for index, line in enumerate(lines) if index not in indexes)
+    if content.endswith("\n"):
+        result += "\n"
+    return result
+
+
+def _strip_hash_comment(line: str) -> str:
+    in_quote = False
+    escaped = False
+    for index, char in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == '"':
+            in_quote = not in_quote
+            continue
+        if char == "#" and not in_quote:
+            return line[:index]
+    return line
 
 
 def _redact_lines(content: str, line_numbers: set[int] | dict[int, str], path: Path) -> str:
@@ -372,6 +778,8 @@ def _redact_lines(content: str, line_numbers: set[int] | dict[int, str], path: P
 
 def _redaction_line(path: Path) -> str:
     suffix = path.suffix.lower()
+    if _is_cmake_file(path) or _is_meson_file(path):
+        return f"# {REDACTION_MARKER}"
     if suffix in {
         ".c",
         ".cc",
@@ -404,15 +812,25 @@ def _is_text_scan_candidate(path: Path) -> bool:
 
 
 def _is_line_redaction_candidate(path: Path) -> bool:
-    return _is_doc_file(path) or _is_cmake_file(path)
+    return _is_cmake_file(path) or _is_meson_file(path) or _is_doc_file(path)
 
 
 def _is_doc_file(path: Path) -> bool:
+    if _is_cmake_file(path) or _is_meson_file(path):
+        return False
     return path.suffix.lower() in DOC_REDACTION_EXTENSIONS or path.name in DOC_REDACTION_NAMES
 
 
 def _is_cmake_file(path: Path) -> bool:
     return path.suffix.lower() in CMAKE_REDACTION_EXTENSIONS or path.name in CMAKE_REDACTION_NAMES
+
+
+def _is_meson_file(path: Path) -> bool:
+    return path.name in MESON_REDACTION_NAMES
+
+
+def _line_has_fuzz_guidance(line: str) -> bool:
+    return any(pattern.search(line) for _name, pattern in FUZZ_GUIDANCE_TEXT_PATTERNS)
 
 
 def _is_ci_workflow(path: Path) -> bool:
@@ -459,11 +877,6 @@ def _read_small_text(path: Path) -> str | None:
         return content.decode("utf-8")
     except UnicodeDecodeError:
         return content.decode("utf-8", errors="ignore")
-
-
-def _line_opens_block(line: str) -> bool:
-    stripped = line.strip()
-    return stripped.endswith("\\") or _paren_delta(line) > 0
 
 
 def _paren_delta(line: str) -> int:

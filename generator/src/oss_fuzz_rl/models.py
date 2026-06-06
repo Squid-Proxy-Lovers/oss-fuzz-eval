@@ -193,41 +193,117 @@ class OracleMetadata:
 
 
 @dataclass(frozen=True)
-class ComponentScore:
-    """A named reward component."""
+class RewardMicrocomponent:
+    """A single normalized v2 reward signal."""
 
     name: str
+    group: str
     value: float
     max_value: float
+    normalized: float
+    weight: float
+    weighted_value: float
     reason: str
+    metrics: JsonDict = field(default_factory=dict)
 
     def to_json(self) -> JsonDict:
         return asdict(self)
 
 
 @dataclass(frozen=True)
+class RewardGroupScore:
+    """A weighted group of reward microcomponents."""
+
+    name: str
+    weight: float
+    normalized: float
+    weighted_value: float
+    microcomponents: tuple[str, ...]
+
+    def to_json(self) -> JsonDict:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class RewardConfig:
+    """Configuration for curriculum-weighted reward scoring."""
+
+    schema_version: str
+    stage: str
+    scalar_range: tuple[float, float]
+    caps: dict[str, float]
+    group_weights: dict[str, float]
+    microcomponent_weights: dict[str, float] = field(default_factory=dict)
+    name: str | None = None
+    training_progress: float = 1.0
+    schedule_alpha: float = 1.0
+
+    def to_json(self) -> JsonDict:
+        data: JsonDict = {
+            "schema_version": self.schema_version,
+            "stage": self.stage,
+            "scalar_range": list(self.scalar_range),
+            "caps": dict(self.caps),
+            "group_weights": dict(self.group_weights),
+            "microcomponent_weights": dict(self.microcomponent_weights),
+            "training_progress": self.training_progress,
+            "schedule_alpha": self.schedule_alpha,
+        }
+        if self.name:
+            data["name"] = self.name
+        return data
+
+    @classmethod
+    def from_json(cls, data: JsonDict) -> RewardConfig:
+        scalar_range_values = tuple(
+            float(value) for value in data.get("scalar_range", [0, 1])
+        )
+        return cls(
+            schema_version=str(data.get("schema_version", "")),
+            stage=str(data.get("stage", "dynamic")),
+            scalar_range=scalar_range_values,  # type: ignore[arg-type]
+            caps={str(key): float(value) for key, value in data.get("caps", {}).items()},
+            group_weights={
+                str(key): float(value) for key, value in data.get("group_weights", {}).items()
+            },
+            microcomponent_weights={
+                str(key): float(value)
+                for key, value in data.get("microcomponent_weights", {}).items()
+            },
+            name=str(data["name"]) if data.get("name") else None,
+            training_progress=float(data.get("training_progress", 1.0)),
+            schedule_alpha=float(data.get("schedule_alpha", 1.0)),
+        )
+
+
+@dataclass(frozen=True)
 class RewardReport:
-    """Complete scoring output for a task episode."""
+    """Complete v3 scoring output for a task episode."""
 
     task_id: str
     scalar_reward: float
     hard_zero: bool
     build_passed: bool
     runtime_passed: bool
-    fuzz_introspector_score: float
-    components: tuple[ComponentScore, ...]
+    caps: JsonDict
+    groups: tuple[RewardGroupScore, ...]
+    microcomponents: tuple[RewardMicrocomponent, ...]
+    raw_metrics: JsonDict
+    reward_config: RewardConfig
     notes: tuple[str, ...] = field(default_factory=tuple)
     artifacts: dict[str, str] = field(default_factory=dict)
+    schema_version: str = "reward.v3"
 
     def to_json(self) -> JsonDict:
         return {
+            "schema_version": self.schema_version,
             "task_id": self.task_id,
             "scalar_reward": self.scalar_reward,
-            "hard_zero": self.hard_zero,
-            "build_passed": self.build_passed,
-            "runtime_passed": self.runtime_passed,
-            "fuzz_introspector_score": self.fuzz_introspector_score,
-            "components": [c.to_json() for c in self.components],
+            "caps": dict(self.caps),
+            "groups": {group.name: group.to_json() for group in self.groups},
+            "microcomponents": [component.to_json() for component in self.microcomponents],
+            "raw_metrics": dict(self.raw_metrics),
+            "reward_config": self.reward_config.to_json(),
             "notes": list(self.notes),
             "artifacts": dict(self.artifacts),
         }
